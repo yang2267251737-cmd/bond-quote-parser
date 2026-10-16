@@ -112,6 +112,51 @@ class StructuredParserTests(unittest.TestCase):
         self.assertEqual(short_date('2027.11.18'), '2027-11-18')
         self.assertIsNone(short_date('1301'))
 
+    def test_compact_full_date_before_code_without_yield(self):
+        text = ('20270923 900015.SH 27演示债辛 760 103.456 '
+                '示例甲证券 Z90001 to 示例乙银行 Z90002 约定号D55 '
+                '（演示甲880000001，演示乙880000004）')
+        for configured in (False, True):
+            with self.subTest(unlabeled_rate_is_yield=configured):
+                row = parse_quotes(text, {**self.settings, 'unlabeled_rate_is_yield': configured})['records'][0]
+                self.assertEqual(row['trade_date'], '2027-09-23')
+                self.assertEqual(row['amount_wan'], '760')
+                self.assertEqual(row['quote_price'], '103.456')
+                self.assertIsNone(row['yield_percent'])
+                self.assertIsNone(row['yield_candidate'])
+                self.assertIsNone(row['price_type'])
+                self.assertEqual(row['action'], '卖出')
+                self.assertEqual(row['buyer'], '示例乙银行')
+                self.assertEqual(row['agreement_no'], 'D55')
+                self.assertEqual([c['raw_line'] for c in row['trading_codes']], ['Z90001', 'Z90002'])
+                self.assertEqual([c['contact_id'] for c in row['contacts']], ['880000001', '880000004'])
+                self.assertTrue(all(c['institution'] is None for c in row['contacts']))
+                self.assertEqual(row['raw_text'], text)
+
+    def test_compact_full_date_with_optional_unlabeled_yield(self):
+        row = parse_quotes('20270923 900015.SH 27演示债辛 760 2.47 103.456 示例甲证券 to 示例乙银行', self.settings)['records'][0]
+        self.assertEqual(row['trade_date'], '2027-09-23')
+        self.assertEqual(row['amount_wan'], '760')
+        self.assertEqual(row['quote_price'], '103.456')
+        self.assertEqual(row['yield_candidate'], '2.47')
+
+    def test_compact_dates_are_validated_without_matching_a_short_suffix(self):
+        self.assertEqual(short_date('20280229'), '2028-02-29')
+        self.assertIsNone(short_date('20270229'))
+        row = parse_quotes('20270229 900015.SH 27演示债辛 760 103.456 示例甲证券 to 示例乙银行', self.settings)['records'][0]
+        self.assertIsNone(row['trade_date'])
+        self.assertEqual(row['amount_wan'], '760')
+        self.assertIsNone(row['yield_candidate'])
+        self.assertIn('DATE_INVALID', [issue['code'] for issue in row['issues']])
+
+    def test_compact_date_with_settlement_speed_is_not_a_numeric_quote(self):
+        row = parse_quotes('20270923+0 900015.SH 27演示债辛 760 103.456 示例甲证券 to 示例乙银行', self.settings)['records'][0]
+        self.assertEqual(row['settlement_date'], '2027-09-23')
+        self.assertEqual(row['settlement_speed'], '+0')
+        self.assertEqual(row['amount_wan'], '760')
+        self.assertEqual(row['quote_price'], '103.456')
+        self.assertIsNone(row['yield_candidate'])
+
     def test_manual_correction_resolves_missing_code_and_preserves_source(self):
         row = self.rows()[5]
         raw = row['raw_text']

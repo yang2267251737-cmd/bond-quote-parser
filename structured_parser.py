@@ -19,7 +19,7 @@ SECTION = re.compile(r"^\s*(?:\d+\s*[、.)]\s*)?(买入|卖出)(?:\s*[-—]\s*(.
 NAME_START = re.compile(r"^\s*(\d{2}[\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff]*)")
 ROUTE = re.compile(r"(?<![A-Za-z])to(?![A-Za-z])|->|=>|→|(?<=\s)出(?=\s)", re.I)
 CONTACT = re.compile(r"([\u4e00-\u9fff]{2,4})\s*(\d{6,12})(?!\d)")
-DATE_TOKEN = r"(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[./-]\d{1,2}|\d{4})"
+DATE_TOKEN = r"(?<!\d)(?:\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[./-]\d{1,2}|\d{4})(?!\d)"
 AMOUNT_UNIT = r"万元面额|亿元面额|万元|亿元|万面额|亿面额|万|亿|元|张|手|[wWkK]"
 BARE = re.compile(rf"(?<![A-Za-z0-9\u4e00-\u9fff.])({NUMBER})(%?)(?![A-Za-z0-9\u4e00-\u9fff.])")
 WORKFLOW_STATES = ("待核对", "已保存未提交", "已提交")
@@ -77,6 +77,8 @@ def short_date(value: str) -> str | None:
         parts = re.split(r"[-/.]", value)
         if len(parts) == 3:
             return date(*map(int, parts)).isoformat()
+        if len(value) == 8 and value.isdigit():
+            return date(int(value[:4]), int(value[4:6]), int(value[6:])).isoformat()
         if len(parts) == 2:
             month, day = map(int, parts)
         elif len(value) == 4:
@@ -159,6 +161,16 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     for match in list(re.finditer(r"\((?=[^)]*(?:理论|还我|返还|返费|费用|备注))[^)]*\)", work)):
         row["notes"].append(match.group())
         remove(match)
+    inline_metadata = []
+    for match in list(re.finditer(r"\(([^)]*)\)", work)):
+        if CONTACT.search(match.group(1)):
+            inline_metadata.extend(part.strip() for part in re.split(r"[,;]", match.group(1)) if part.strip())
+            remove(match)
+    agreement = re.search(r"约定(?:号|编号)\s*:?\s*([A-Za-z0-9]+)", work)
+    if agreement:
+        row["agreement_no"] = agreement.group(1)
+        evidence("agreement_no", agreement.group(), "同一行约定号标签")
+        remove(agreement)
     for label in ("内评", "授信"):
         pattern = rf"(?:【{label}】|\[{label}\])"
         for match in list(re.finditer(pattern, work)):
@@ -211,10 +223,16 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
             evidence("trade_date", match.group(), "交易日期标签")
             remove(match)
     leading_date = re.match(rf"\s*({DATE_TOKEN})(?=\s)", work) if code and code.start() > 0 else None
-    if leading_date and short_date(leading_date.group(1)):
-        row["trade_date"] = short_date(leading_date.group(1))
+    if leading_date:
+        parsed = short_date(leading_date.group(1))
         row["date_raw"] = leading_date.group(1)
-        warn("DATE_ROLE", "首部无标签日期作为交易日候选，需核对日期用途", "trade_date")
+        if parsed:
+            row["trade_date"] = parsed
+            evidence("trade_date", leading_date.group(1), "代码前的首部日期；按日历校验后提取，未参与金额或收益率分配")
+            warn("DATE_ROLE", "首部无标签日期作为交易日候选，需核对日期用途", "trade_date")
+        else:
+            row["notes"].append("无效日期: " + leading_date.group(1))
+            warn("DATE_INVALID", "首部日期无效，已保留原文且不作为金额或收益率", "trade_date")
         remove(leading_date)
     term = re.search(r"(?<![A-Za-z0-9.])\d+(?:\.\d+)?\s*Y(?:\s*\+\s*N)?(?:\s*\([^)]*\))?", work, re.I)
     if term:
@@ -313,7 +331,9 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
             return None
         org = institution(tokens[0], settings)
         for token in tokens[1:]:
-            if re.fullmatch(r"[\u4e00-\u9fff]{2,4}", token):
+            if re.fullmatch(r"Z\d{5,}", token, re.I):
+                row["trading_codes"].append({"institution": org, "raw_line": token, "kind": "Z代码"})
+            elif re.fullmatch(r"[\u4e00-\u9fff]{2,4}", token):
                 row["contacts"].append({"name": token, "contact_id": None, "institution": org, "source": "机构后的姓名"})
             else:
                 row["notes"].append(token)
@@ -351,7 +371,7 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         row["first_hand_party"] = row["from_party"]
 
     metadata_org = None
-    for _, raw_line in lines[1:]:
+    for raw_line in [*inline_metadata, *(line for _, line in lines[1:])]:
         line = normalized(raw_line).strip()
         timestamp = re.search(r"(?<!\d)(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)", line)
         if timestamp:
