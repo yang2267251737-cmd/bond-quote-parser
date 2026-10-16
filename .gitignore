@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+node_modules/
+.pytest_cache/
+
+# Business inputs, generated results, and local backups never belong in Git.
+/.local-private/
+/private/
+/data/
+/input/
+/inputs/
+/output/
+/outputs/
+/tools/
+*.zip
+*.csv
+*.xlsx
+*.xls
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.log
+*.ndjson
+*.db
+*.sqlite*
+.env
+.env.*
+config.local.json
+
+# Only the explicitly fictional demo is shareable.
+/examples/*
+!/examples/demo.txt

@@ -1,0 +1,13 @@
+{
+  "default_amount_unit": "万元",
+  "default_price_type": null,
+  "unlabeled_rate_is_yield": false,
+  "to_means_seller_to_buyer": false,
+  "institution_aliases": {
+    "示例甲": "示例甲证券",
+    "示例甲证券": "示例甲证券",
+    "示例乙": "示例乙银行",
+    "示例乙银行": "示例乙银行"
+  },
+  "contact_directory": {}
+}
