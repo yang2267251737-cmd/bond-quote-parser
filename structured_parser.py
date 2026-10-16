@@ -15,7 +15,7 @@ DEFAULT_SETTINGS = {
     "default_amount_unit": "万元", "to_direction": "seller_to_buyer",
     "k_multiplier_wan": None, "unlabeled_rate_is_yield": False,
 }
-SECTION = re.compile(r"^\s*(?:\d+\s*[、.)]\s*)?(买入|卖出)(?:\s*[-—]\s*(.*))?\s*$")
+SECTION = re.compile(r"^\s*(?:\d+\s*[、.)]\s*)?(买入|卖出|组合|架桥|普通报价)(?:\s*[-—]\s*(.*))?\s*$")
 NAME_START = re.compile(r"^\s*(\d{2}[\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff]*)")
 ROUTE = re.compile(r"(?<![A-Za-z])to(?![A-Za-z])|->|=>|→|(?<=\s)出(?=\s)", re.I)
 CONTACT = re.compile(r"([\u4e00-\u9fff]{2,4})\s*(\d{6,12})(?!\d)")
@@ -23,6 +23,7 @@ DATE_TOKEN = r"(?<!\d)(?:\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[./-]\d{1,2}
 AMOUNT_UNIT = r"万元面额|亿元面额|万元|亿元|万面额|亿面额|万|亿|元|张|手|[wWkK]"
 BARE = re.compile(rf"(?<![A-Za-z0-9\u4e00-\u9fff.])({NUMBER})(%?)(?![A-Za-z0-9\u4e00-\u9fff.])")
 WORKFLOW_STATES = ("待核对", "已保存未提交", "已提交")
+BUSINESS_TYPES = ("普通报价", "回推要素", "组合/架桥")
 
 
 def normalized(value: str) -> str:
@@ -92,8 +93,14 @@ def short_date(value: str) -> str | None:
 
 
 def split_records(raw: str) -> tuple[list[dict], list[dict]]:
-    records, context_lines, current = [], [], None
-    context = {"section_action": None, "section_label": None, "section_owner": None}
+    records, context_lines, current, pending = [], [], None, []
+    context = {"section_action": None, "section_label": None, "section_owner": None,
+               "business_type": "普通报价", "section_id": None, "section_title": None}
+
+    def keep_unassigned():
+        context_lines.extend({"line": number, "text": value, "unassigned_header": True} for number, value in pending)
+        pending.clear()
+
     for line_number, line in enumerate(raw.splitlines(), 1):
         text = normalized(line).strip()
         if not text:
@@ -105,24 +112,40 @@ def split_records(raw: str) -> tuple[list[dict], list[dict]]:
             if current:
                 records.append(current)
                 current = None
+            keep_unassigned()
             context_lines.append({"line": line_number, "text": line})
             if owner:
                 context["section_owner"] = clean(owner.group(1))
                 context["section_action"] = context["section_label"] = None
+                context.update(business_type="普通报价", section_id=None, section_title=None)
             if section:
-                context["section_action"] = section.group(1)
+                label = section.group(1)
+                context["section_action"] = label if label in ("买入", "卖出") else None
                 context["section_label"] = section.group(2)
+                kind = "组合/架桥" if label in ("组合", "架桥") else "回推要素" if "回推" in (section.group(2) or "") else "普通报价"
+                context.update(business_type=kind, section_id=f"S{line_number:03d}", section_title=line)
             continue
         if CODE.search(text) or NAME_START.match(text):
             if current:
                 records.append(current)
-            current = {"lines": [(line_number, line)], "context": context.copy()}
+            current = {"lines": [*pending, (line_number, line)], "quote_line_index": len(pending), "context": context.copy()}
+            pending.clear()
+        elif ROUTE.search(text) or re.fullmatch(rf"{DATE_TOKEN}(?:\s*\+\s*[0-2])?\s*[,;]?", text):
+            if current:
+                records.append(current)
+                current = None
+            if ROUTE.search(text) and any(ROUTE.search(normalized(value)) for _, value in pending):
+                keep_unassigned()
+            pending.append((line_number, line))
+        elif pending:
+            pending.append((line_number, line))
         elif current:
             current["lines"].append((line_number, line))
         else:
             context_lines.append({"line": line_number, "text": line})
     if current:
         records.append(current)
+    keep_unassigned()
     return records, context_lines
 
 
@@ -139,6 +162,7 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     )}
     row.update(record_id=f"Q{index:03d}", action="待确认", section_action=context["section_action"],
                section_owner=context["section_owner"], workflow_kind=context["section_label"],
+               business_type=context.get("business_type", "普通报价"), section_id=context.get("section_id"),
                workflow_status="待核对", contacts=[], trading_codes=[], notes=[], requirements=[],
                parser_issues=[], issues=[], evidence={}, manual_fields=[], audit=[], raw_text=raw,
                source_line_start=lines[0][0], source_line_end=lines[-1][0],
@@ -152,7 +176,10 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     def evidence(field: str, snippet: str, method: str) -> None:
         row["evidence"][field] = {"snippet": snippet, "method": method}
 
-    work = normalized(lines[0][1])
+    quote_line_index = segment.get("quote_line_index", 0)
+    work = normalized(" ".join(line for _, line in lines[:quote_line_index + 1]))
+    if context.get("section_title"):
+        evidence("business_type", context["section_title"], "来自本笔所属分组标题；业务类型独立于买卖动作")
 
     def remove(match) -> None:
         nonlocal work
@@ -204,10 +231,12 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         evidence("bond_code", code.group(), "代码形态识别，未连接证券主数据")
         remove(code)
     else:
-        name = NAME_START.match(work)
+        quote_offset = len(normalized(" ".join(line for _, line in lines[:quote_line_index]))) + 1 if quote_line_index else 0
+        name = NAME_START.match(work[quote_offset:])
         if name:
             row["bond_name"] = name.group(1)
-            remove(name)
+            start, end = quote_offset + name.start(), quote_offset + name.end()
+            work = work[:start] + " " * (end - start) + work[end:]
 
     for match in list(re.finditer(rf"({DATE_TOKEN})\s*\+\s*([0-2])", work)):
         parsed = short_date(match.group(1))
@@ -239,10 +268,10 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         row["term"] = term.group().strip()
         evidence("term", term.group(), "Y 期限及可选 +N / 休息日说明")
         remove(term)
-    request = re.search(r"请求\s*发\s*([^\s,，;；]+)", work)
+    request = re.search(r"请求\s*(?:发\s*)?([^\s,，;；]+)", work)
     if request:
         row["request_to"] = institution(request.group(1), settings)
-        evidence("request_to", request.group(), "请求发标签")
+        evidence("request_to", request.group(), "请求/请求发标签")
         remove(request)
 
     prices = list(re.finditer(rf"(净价|全价|价格)\s*[:=]?\s*({NUMBER})", work))
@@ -285,7 +314,16 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
             warn("RATE_CONTEXT", "百分数作为收益率候选，需确认不是票息或其他利率", "yield_candidate")
         else:
             warn("EXTRA_PERCENT", "存在额外百分数，需核对含义", "yield_percent")
+    def looks_like_rate(value):
+        return abs(Decimal(value)) < 20
+
+    def looks_like_price(value):
+        return Decimal(20) <= Decimal(value) <= Decimal(200)
+
+    # These ranges only disambiguate unlabeled templates. Explicit labels have no range restriction.
     rate_amount_template = bool(context["section_action"] or re.search(r"\s出\s", work)) and not prices and not rates
+    if rate_amount_template and len(bare) == 2 and not looks_like_rate(bare[0][0]):
+        rate_amount_template = False
     if not amount_tokens and bare:
         amount = bare.pop() if rate_amount_template and len(bare) == 2 else bare.pop(0)
         amount_tokens.append((amount[0], None, amount[2]))
@@ -308,16 +346,30 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         evidence("amount_wan", snippet, "显式单位优先；无标签金额按模板和默认单位解释")
     elif len(amount_tokens) > 1:
         warn("AMOUNT_CONFLICT", "存在多个金额，请人工选择", "amount_wan")
-    if not prices and not rates and not rate_amount_template and bare:
-        price = bare.pop()
-        row["quote_price"] = price[0]
-        evidence("quote_price", price[2], "无标签报价模板的最后一个数字")
-    if bare and len(bare) == 1 and not rates:
+    unresolved_pair = False
+    if not prices and not rate_amount_template and bare:
+        price = None
+        if len(bare) == 1:
+            price = bare.pop()
+        elif len(bare) == 2 and not rates:
+            possibilities = [(p, y) for p in range(2) for y in range(2)
+                             if p != y and looks_like_price(bare[p][0]) and looks_like_rate(bare[y][0])]
+            if len(possibilities) == 1:
+                p, y = possibilities[0]
+                price, candidate = bare[p], bare[y]
+                bare = [candidate]
+            else:
+                unresolved_pair = True
+                warn("PRICE_RATE_AMBIGUOUS", "两个无标签数字无法可靠区分价格与收益率，已保留原值待核对", "quote_price")
+        if price:
+            row["quote_price"] = price[0]
+            evidence("quote_price", price[2], "面额之后的唯一价格，或通过价格/利率常见区间消歧；不依赖两者先后顺序")
+    if bare and len(bare) == 1 and not rates and not unresolved_pair:
         candidate = bare.pop()
         target = "yield_percent" if settings["unlabeled_rate_is_yield"] else "yield_candidate"
         row[target] = candidate[0]
         row["yield_type"] = "未注明"
-        evidence(target, candidate[2], "分组收益率+金额模板" if rate_amount_template else "金额、候选收益率、价格模板")
+        evidence(target, candidate[2], "分组收益率+金额模板" if rate_amount_template else "面额及价格之外的利率候选；价格与利率允许换序")
         if target == "yield_candidate":
             warn("UNLABELED_RATE", "无标签利率仅作为候选，可修改配置或手工确认", "yield_candidate")
     if bare:
@@ -326,6 +378,7 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
 
     def party(text: str) -> str | None:
         text = clean(text)
+        text = re.sub(r"(?<=[\u4e00-\u9fff])(?=Z\d{5,}\b)", " ", text, flags=re.I)
         tokens = text.split()
         if not tokens:
             return None
@@ -371,7 +424,7 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         row["first_hand_party"] = row["from_party"]
 
     metadata_org = None
-    for raw_line in [*inline_metadata, *(line for _, line in lines[1:])]:
+    for raw_line in [*inline_metadata, *(line for _, line in lines[quote_line_index + 1:])]:
         line = normalized(raw_line).strip()
         timestamp = re.search(r"(?<!\d)(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)", line)
         if timestamp:
@@ -439,6 +492,8 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
 
 
 def review_record(row: dict) -> dict:
+    if not row.get("business_type"):
+        row["business_type"] = "回推要素" if "回推" in (row.get("workflow_kind") or "") else "普通报价"
     issues = [item.copy() for item in row.get("parser_issues", []) if item["field"] not in row.get("manual_fields", [])]
     def add(code: str, message: str, field: str):
         if not any(item["code"] == code for item in issues):
@@ -449,6 +504,8 @@ def review_record(row: dict) -> dict:
         add("CODE_INVALID", "债券代码格式不受支持", "bond_code")
     if not row.get("bond_name"):
         add("NAME_MISSING", "缺少债券简称", "bond_name")
+    if row.get("business_type") not in BUSINESS_TYPES:
+        add("BUSINESS_TYPE_INVALID", "业务类型无效，请选择普通报价、回推要素或组合/架桥", "business_type")
     for key in ("amount_wan", "quote_price", "yield_percent", "yield_candidate", "theoretical_price", "adjustment_amount"):
         value = row.get(key)
         if value not in (None, ""):
@@ -501,6 +558,8 @@ def parse_quotes(raw: str, options: dict | None = None) -> dict:
         warnings.append("没有找到可识别报价；请检查代码或简称，不代表输入中没有报价。")
     if not settings["self_company"]:
         warnings.append("请填写本方公司，以判断相对本方的买卖动作。")
+    if any(line.get("unassigned_header") for line in context_lines):
+        warnings.append("有日期或机构方向表头未找到对应债券，已保留在未归属文字中，请检查。")
     return {"schema_version": "0.2", "records": rows, "original_input": raw,
             "settings": settings, "context_lines": context_lines, "input_warnings": warnings,
             "record_count": len(rows), "review_count": sum(bool(row["issues"]) for row in rows)}

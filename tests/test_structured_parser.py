@@ -157,6 +157,110 @@ class StructuredParserTests(unittest.TestCase):
         self.assertEqual(row['quote_price'], '103.456')
         self.assertIsNone(row['yield_candidate'])
 
+    def test_price_and_yield_can_appear_in_either_order(self):
+        for middle in ('104.2671 2.63', '2.63 104.2671'):
+            for amount in ('680', '680w'):
+                with self.subTest(middle=middle, amount=amount):
+                    row = parse_quotes(f'900000016.IB 27演示PPN甲 {amount} {middle} 示例丁资管 to 示例甲证券', self.settings)['records'][0]
+                    self.assertEqual(row['amount_wan'], '680')
+                    self.assertEqual(row['quote_price'], '104.2671')
+                    self.assertEqual(row['yield_candidate'], '2.63')
+                    self.assertIsNone(row['yield_percent'])
+
+    def test_multiline_header_belongs_to_following_bond(self):
+        text = ('7.14+0，示例丁资管Z90009 演示丙 to示例甲证券\n'
+                '900000016.IB 27演示PPN甲 680 104.2671 2.63')
+        row = parse_quotes(text, self.settings)['records'][0]
+        self.assertEqual(row['settlement_date'], '07-14')
+        self.assertEqual(row['settlement_speed'], '+0')
+        self.assertEqual(row['seller'], '示例丁资管')
+        self.assertEqual(row['buyer'], '示例甲证券')
+        self.assertEqual(row['action'], '买入')
+        self.assertEqual(row['contacts'][0]['name'], '演示丙')
+        self.assertEqual(row['trading_codes'][0]['raw_line'], 'Z90009')
+        self.assertEqual((row['source_line_start'], row['source_line_end']), (1, 2))
+        self.assertEqual(row['raw_text'], text)
+        self.assertEqual(row['quote_price'], '104.2671')
+        self.assertEqual(row['yield_candidate'], '2.63')
+
+    def test_bridge_section_keeps_both_legs_and_separate_headers(self):
+        text = ('10、组合\n'
+                '7.14+0，示例丁期货 to 示例甲证券，请求示例甲证券\n'
+                '900000017.IB 27演示MTN丙(示例) 640 5.73 净价96.4123\n\n'
+                '7.14+0，示例甲证券 to 示例乙银行测试产品9号，请求示例甲证券\n'
+                '900000017.IB 27演示MTN丙(示例) 640w 净价96.4187')
+        rows = parse_quotes(text, self.settings)['records']
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r['business_type'] for r in rows], ['组合/架桥', '组合/架桥'])
+        self.assertEqual([r['action'] for r in rows], ['买入', '卖出'])
+        self.assertEqual([r['counterparty'] for r in rows], ['示例丁期货', '示例乙银行测试产品9号'])
+        self.assertEqual([r['amount_wan'] for r in rows], ['640', '640'])
+        self.assertEqual([r['quote_price'] for r in rows], ['96.4123', '96.4187'])
+        self.assertEqual([r['yield_candidate'] for r in rows], ['5.73', None])
+        self.assertTrue(all(r['bond_name'] == '27演示MTN丙(示例)' for r in rows))
+        self.assertTrue(all(r['request_to'] == '示例甲证券' for r in rows))
+        self.assertTrue(all(r['settlement_date'] == '07-14' for r in rows))
+        self.assertEqual([r['source_line_start'] for r in rows], [2, 5])
+        self.assertNotIn('测试产品9号', rows[0]['raw_text'])
+        self.assertEqual(rows[0]['section_id'], rows[1]['section_id'])
+        self.assertEqual(rows[0]['evidence']['business_type']['snippet'], '10、组合')
+
+    def test_business_type_resets_at_next_section(self):
+        text = ('组合\n900010.SH 27演示债丁 120 净价97.6543 示例甲证券 to 示例乙银行\n'
+                '11、买入-回推要素\n900012.SZ 27演示债戊 120 净价97.6543 示例乙银行 to 示例甲证券\n'
+                '12、卖出\n900013.SH 27演示债己 120 净价97.6543 示例甲证券 to 示例乙银行')
+        rows = parse_quotes(text, self.settings)['records']
+        self.assertEqual([r['business_type'] for r in rows], ['组合/架桥', '回推要素', '普通报价'])
+
+    def test_unassigned_header_is_retained_and_warned(self):
+        text = '7.14+0，示例甲证券 to 示例乙银行'
+        result = parse_quotes(text, self.settings)
+        self.assertEqual(result['records'], [])
+        self.assertEqual(result['context_lines'][0]['text'], text)
+        self.assertTrue(any('未找到对应债券' in warning for warning in result['input_warnings']))
+
+    def test_ambiguous_pair_is_not_silently_assigned(self):
+        row = parse_quotes('900010.SH 27演示债丁 120 97.1 98.2 示例甲证券 to 示例乙银行', self.settings)['records'][0]
+        self.assertIsNone(row['quote_price'])
+        self.assertIsNone(row['yield_candidate'])
+        self.assertIn('PRICE_RATE_AMBIGUOUS', [i['code'] for i in row['issues']])
+        self.assertIn('97.1', row['notes_text'])
+        self.assertIn('98.2', row['notes_text'])
+
+    def test_buy_section_without_yield_keeps_amount_and_price(self):
+        row = parse_quotes('买入\n900010.SH 27演示债丁 760 103.456 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['amount_wan'], '760')
+        self.assertEqual(row['quote_price'], '103.456')
+        self.assertIsNone(row['yield_candidate'])
+
+    def test_legacy_rows_get_business_type_without_losing_original(self):
+        row = self.rows()[4]
+        row.pop('business_type')
+        original = row['raw_text']
+        review_record(row)
+        self.assertEqual(row['business_type'], '回推要素')
+        self.assertEqual(row['raw_text'], original)
+
+    def test_header_on_separate_lines_and_missing_code_keep_bond_name(self):
+        text = '7.14+0\n示例乙银行 to 示例甲证券\n27演示债庚 760 净价103.456'
+        row = parse_quotes(text, self.settings)['records'][0]
+        self.assertEqual(row['bond_name'], '27演示债庚')
+        self.assertIsNone(row['bond_code'])
+        self.assertEqual(row['action'], '买入')
+        self.assertEqual(row['amount_wan'], '760')
+        self.assertEqual(row['settlement_date'], '07-14')
+        self.assertIn('CODE_MISSING', [i['code'] for i in row['issues']])
+
+    def test_numeric_heuristics_do_not_restrict_explicit_labels(self):
+        row = parse_quotes('900010.SH 27演示债丁 760 净价15 收益率55% 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['quote_price'], '15')
+        self.assertEqual(row['yield_percent'], '55')
+
+    def test_negative_yield_can_follow_unlabeled_price(self):
+        row = parse_quotes('900010.SH 27演示债丁 760 103.456 -0.38 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['quote_price'], '103.456')
+        self.assertEqual(row['yield_candidate'], '-0.38')
+
     def test_manual_correction_resolves_missing_code_and_preserves_source(self):
         row = self.rows()[5]
         raw = row['raw_text']

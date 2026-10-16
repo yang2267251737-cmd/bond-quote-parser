@@ -5,7 +5,8 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const state = {batch: null, previous: null, base: {}, demo: '', edited: false, stale: false, sequence: 0, changes: 0, saving: false, inspected: null, timer: null, revisions: new Map(), reviews: new Set()};
 const columns = [
   ['action', '本方动作', ['待确认', '买入', '卖出', '非本方']],
-  ['bond_code', '债券代码'], ['bond_name', '债券简称'], ['amount_wan', '面额（万元）'],
+  ['bond_code', '债券代码'], ['bond_name', '债券简称'],
+  ['business_type', '业务类型', ['普通报价', '回推要素', '组合/架桥']], ['amount_wan', '面额（万元）'],
   ['quote_price', '报价价格'], ['price_type', '价格类型', ['', '净价', '全价']],
   ['rate', '收益率（%）'], ['counterparty', '对手方'], ['requirements_text', '内评／授信'],
   ['workflow_status', '工作状态', ['待核对', '已保存未提交', '已提交']], ['notes_text', '备注'],
@@ -139,7 +140,8 @@ function render() {
           const values = [...options]; if (row[field] && !values.includes(row[field])) values.push(row[field]);
           for (const value of values) { const option = node('option', value || '待确认'); option.value = value; input.append(option); }
         } else { input.type = 'text'; input.autocomplete = 'off'; input.spellcheck = false; }
-        input.value = (key === 'rate' ? row.yield_percent ?? row.yield_candidate : row[field]) || '';
+        const value = key === 'rate' ? row.yield_percent ?? row.yield_candidate : key === 'business_type' ? row.business_type || (row.workflow_kind?.includes('回推') ? '回推要素' : '普通报价') : row[field];
+        input.value = value || '';
         input.setAttribute('aria-label', `${row.record_id} ${label}`);
         if (numeric.has(key)) { input.inputMode = 'decimal'; input.classList.add('number'); }
         decorateInput(input, row, key);

@@ -23,7 +23,7 @@ EDITABLE_FIELDS = {
     'yield_percent', 'yield_candidate', 'yield_type', 'term', 'trade_date',
     'settlement_date', 'settlement_speed', 'seller', 'buyer', 'counterparty',
     'request_to', 'contacts_text', 'agreement_no', 'requirements_text',
-    'notes_text', 'workflow_status', 'theoretical_price', 'adjustment_amount',
+    'notes_text', 'workflow_status', 'business_type', 'theoretical_price', 'adjustment_amount',
 }
 
 
@@ -68,7 +68,12 @@ class LocalStore:
             return None
         with self.lock, closing(self.connect()) as connection, connection:
             row = connection.execute('SELECT payload FROM batches WHERE id=?', (batch_id,)).fetchone()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        payload = json.loads(row[0])
+        for record in payload.get('records', []):
+            review_record(record)
+        return payload
 
     def save_batch(self, payload):
         records = payload.get('records')

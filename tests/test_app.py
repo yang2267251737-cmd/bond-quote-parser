@@ -86,6 +86,18 @@ class LocalAppTests(unittest.TestCase):
         reviewed = self.request('/api/review', {'record': row})['record']
         self.assertIn('INVALID_amount_wan', [i['code'] for i in reviewed['issues']])
 
+    def test_business_type_manual_change_persists_and_original_type_stays_traceable(self):
+        parsed = self.request('/api/parse', {'text': '组合\n' + self.sample, 'settings': self.settings})
+        parsed['original_records'] = copy.deepcopy(parsed['records'])
+        record = parsed['records'][0]
+        self.assertEqual(record['business_type'], '组合/架桥')
+        record.update(business_type='普通报价', manual_fields=['business_type'])
+        self.request('/api/review', {'record': record})
+        saved = self.request('/api/save', parsed)
+        loaded = self.request('/api/batches/' + saved['batch_id'])
+        self.assertEqual(loaded['records'][0]['business_type'], '普通报价')
+        self.assertEqual(loaded['original_records'][0]['business_type'], '组合/架桥')
+
     def test_no_internet_assets_in_app_bootstrap(self):
         data = self.request('/api/bootstrap')
         self.assertEqual(data['settings']['self_company'], '')
