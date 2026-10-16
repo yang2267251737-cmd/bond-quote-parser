@@ -8,7 +8,9 @@
 
 真实报价、联系人、交易账号、机构对应关系、实际成交信息、生成的 CSV/JSON/Excel、预览图片、日志、压缩包和原始文档备份只保存在本地。配置中的机构字典和通讯录也属于业务数据，不直接提交。
 
-`.gitignore` 排除输入输出目录、本地配置、备份、图片、表格和压缩包。examples 目录只允许虚构的 demo.txt。使用真实数据时，应指定被忽略的输入目录和 config.local.json。
+`.gitignore` 排除输入输出目录、本地配置及其临时文件、备份、图片、表格和压缩包。examples 目录只允许虚构的 demo.txt 与 software_demo.txt。使用真实数据时，应指定被忽略的输入目录和 config.local.json。
+
+本地工作台只在明确点击“保存本地”后把业务批次写入 `.local-private/software/quotes.sqlite3`。配置保存到 config.local.json。数据库、导出文件及截图不得随项目发布；发布包只从审阅后的 Git 文件清单构建，不直接压缩整个工作目录。
 
 ## 提交前流程
 

@@ -10,6 +10,9 @@ RELEASE_FILES = (
     '.gitignore', 'README.md', 'config.json', 'quote_parser.py',
     'examples/demo.txt', 'tests/test_parser.py',
     'docs/confidentiality.md', 'scripts/check_release.py',
+    'PRODUCT.md', 'DESIGN.md', 'app.py', 'structured_parser.py', '启动软件.cmd',
+    'web/index.html', 'web/app.css', 'web/app.js',
+    'examples/software_demo.txt', 'tests/test_app.py', 'tests/test_structured_parser.py',
 )
 
 
