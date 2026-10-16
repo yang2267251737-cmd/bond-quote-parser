@@ -261,6 +261,80 @@ class StructuredParserTests(unittest.TestCase):
         self.assertEqual(row['quote_price'], '103.456')
         self.assertEqual(row['yield_candidate'], '-0.38')
 
+    def test_additive_amount_with_optional_yield_and_glued_institution_name(self):
+        text = ('2027/9/23\t900018.SH\t27演示债壬\t680+420\t103.246\t\t示例丁资管演示丙 to\t示例甲证券 演示甲\n'
+                '2027/9/23\t900019.SH\t27演示债癸\t680+420\t103.267\t2.73\t示例丁资管演示丙 to\t示例甲证券 演示甲 约定号0012，0034')
+        rows = parse_quotes(text, self.settings)['records']
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r['amount_wan'] for r in rows], ['1100', '1100'])
+        self.assertEqual([r['quote_price'] for r in rows], ['103.246', '103.267'])
+        self.assertEqual([r['yield_candidate'] for r in rows], [None, '2.73'])
+        for row in rows:
+            self.assertEqual(row['trade_date'], '2027-09-23')
+            self.assertEqual(row['action'], '买入')
+            self.assertEqual(row['counterparty'], '示例丁资管')
+            self.assertEqual(row['amount_expression'], '680+420')
+            self.assertEqual([part['amount_raw'] for part in row['amount_components']], ['680', '420'])
+            self.assertEqual(row['party_name_candidates'][0]['source'], '示例丁资管演示丙')
+            self.assertIn('PARTY_NAME_BOUNDARY', [item['code'] for item in row['issues']])
+        self.assertEqual(rows[1]['agreement_nos'], ['0012', '0034'])
+        self.assertEqual(rows[1]['agreement_no'], '0012、0034')
+        self.assertIn('MULTIPLE_AGREEMENTS', [item['code'] for item in rows[1]['issues']])
+        self.assertTrue(all('agreement_no' not in part for part in rows[1]['amount_components']))
+        self.assertEqual(rows[1]['raw_text'], text.splitlines()[1])
+
+    def test_additive_amount_with_explicit_label_and_trailing_unit(self):
+        row = parse_quotes('900010.SH 27演示债丁 面额80 + 20w 净价103.456 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['amount_wan'], '100')
+        self.assertEqual(row['amount_yuan'], '1000000')
+        self.assertEqual([part['amount_unit'] for part in row['amount_components']], ['万元', '万元'])
+        self.assertIsNone(row['yield_candidate'])
+
+    def test_additive_amount_converts_explicit_mixed_units(self):
+        row = parse_quotes('900010.SH 27演示债丁 1亿元+500万元 净价103.456 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['amount_wan'], '10500')
+        self.assertEqual([part['amount_wan'] for part in row['amount_components']], ['10000', '500'])
+
+    def test_additive_amount_without_confirmed_unit_is_not_converted(self):
+        row = parse_quotes('900010.SH 27演示债丁 80+20 净价103.456 示例乙银行 to 示例甲证券', {**self.settings, 'default_amount_unit': None})['records'][0]
+        self.assertIsNone(row['amount_wan'])
+        self.assertEqual(row['amount_expression'], '80+20')
+        self.assertEqual(row['quote_price'], '103.456')
+        self.assertIn('SPLIT_AMOUNT_UNIT', [item['code'] for item in row['issues']])
+
+    def test_additive_k_amount_remains_opt_in(self):
+        text = '900010.SH 27演示债丁 1K+2K 净价103.456 示例乙银行 to 示例甲证券'
+        self.assertIsNone(parse_quotes(text, self.settings)['records'][0]['amount_wan'])
+        row = parse_quotes(text, {**self.settings, 'k_multiplier_wan': 1000})['records'][0]
+        self.assertEqual(row['amount_wan'], '3000')
+
+    def test_multiple_agreements_on_following_lines_are_all_preserved(self):
+        text = ('900010.SH 27演示债丁 120 净价103.456 示例乙银行 to 示例甲证券\n'
+                '约定号E01、E02\n约定编号E03')
+        row = parse_quotes(text, self.settings)['records'][0]
+        self.assertEqual(row['agreement_nos'], ['E01', 'E02', 'E03'])
+        self.assertEqual(row['agreement_no'], 'E01、E02、E03')
+        self.assertEqual(row['amount_wan'], '120')
+
+    def test_agreement_manual_edit_updates_identifier_list(self):
+        row = self.rows()[5]
+        row.update(agreement_no='0008，0019', manual_fields=['agreement_no'])
+        review_record(row)
+        self.assertEqual(row['agreement_nos'], ['0008', '0019'])
+
+    def test_company_suffix_and_numbered_product_are_not_split_as_contacts(self):
+        for name in ('示例丁资管有限公司', '示例乙银行测试产品9号'):
+            with self.subTest(name=name):
+                row = parse_quotes(f'900010.SH 27演示债丁 120 净价103.456 {name} to 示例甲证券', self.settings)['records'][0]
+                self.assertEqual(row['counterparty'], name)
+                self.assertEqual(row['party_name_candidates'], [])
+
+    def test_glued_self_alias_is_only_a_contact_candidate(self):
+        row = parse_quotes('900010.SH 27演示债丁 120 净价103.456 示例乙银行 to 示例甲演示丙', self.settings)['records'][0]
+        self.assertEqual(row['action'], '买入')
+        self.assertEqual(row['buyer'], '示例甲证券')
+        self.assertTrue(row['contacts'][0]['name_is_candidate'])
+
     def test_manual_correction_resolves_missing_code_and_preserves_source(self):
         row = self.rows()[5]
         raw = row['raw_text']

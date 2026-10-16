@@ -24,6 +24,21 @@ AMOUNT_UNIT = r"万元面额|亿元面额|万元|亿元|万面额|亿面额|万|
 BARE = re.compile(rf"(?<![A-Za-z0-9\u4e00-\u9fff.])({NUMBER})(%?)(?![A-Za-z0-9\u4e00-\u9fff.])")
 WORKFLOW_STATES = ("待核对", "已保存未提交", "已提交")
 BUSINESS_TYPES = ("普通报价", "回推要素", "组合/架桥")
+UNSIGNED_NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+AMOUNT_PART = rf"{UNSIGNED_NUMBER}(?:\s*(?:{AMOUNT_UNIT}))?"
+ADDITIVE_AMOUNT = rf"{AMOUNT_PART}(?:\s*\+\s*{AMOUNT_PART})+"
+AGREEMENT = re.compile(r"约定(?:号|编号)\s*:?\s*([A-Za-z0-9]+(?:\s*[,、/]\s*[A-Za-z0-9]+)*)")
+
+
+def amount_unit(value):
+    return {"w": "万元", "W": "万元", "万": "万元", "万元面额": "万元", "万面额": "万元",
+            "亿": "亿元", "亿元面额": "亿元", "亿面额": "亿元", "k": "K"}.get(value, value)
+
+
+def amount_factor(unit, settings):
+    if unit == "K":
+        return Decimal(settings["k_multiplier_wan"]) * 10000 if settings["k_multiplier_wan"] else None
+    return {"元": Decimal(1), "万元": Decimal(10000), "亿元": Decimal(100000000)}.get(unit)
 
 
 def normalized(value: str) -> str:
@@ -163,6 +178,7 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     row.update(record_id=f"Q{index:03d}", action="待确认", section_action=context["section_action"],
                section_owner=context["section_owner"], workflow_kind=context["section_label"],
                business_type=context.get("business_type", "普通报价"), section_id=context.get("section_id"),
+               amount_expression=None, amount_components=[], agreement_nos=[], party_name_candidates=[],
                workflow_status="待核对", contacts=[], trading_codes=[], notes=[], requirements=[],
                parser_issues=[], issues=[], evidence={}, manual_fields=[], audit=[], raw_text=raw,
                source_line_start=lines[0][0], source_line_end=lines[-1][0],
@@ -175,6 +191,11 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
 
     def evidence(field: str, snippet: str, method: str) -> None:
         row["evidence"][field] = {"snippet": snippet, "method": method}
+
+    def capture_agreement(match):
+        row["agreement_nos"].extend(re.split(r"\s*[,、/]\s*", match.group(1)))
+        row["agreement_no"] = "、".join(row["agreement_nos"])
+        evidence("agreement_no", row["agreement_no"], "完整保留同一标签下及后续行的多个约定号，不自动绑定拆分面额")
 
     quote_line_index = segment.get("quote_line_index", 0)
     work = normalized(" ".join(line for _, line in lines[:quote_line_index + 1]))
@@ -193,10 +214,8 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         if CONTACT.search(match.group(1)):
             inline_metadata.extend(part.strip() for part in re.split(r"[,;]", match.group(1)) if part.strip())
             remove(match)
-    agreement = re.search(r"约定(?:号|编号)\s*:?\s*([A-Za-z0-9]+)", work)
-    if agreement:
-        row["agreement_no"] = agreement.group(1)
-        evidence("agreement_no", agreement.group(), "同一行约定号标签")
+    for agreement in list(AGREEMENT.finditer(work)):
+        capture_agreement(agreement)
         remove(agreement)
     for label in ("内评", "授信"):
         pattern = rf"(?:【{label}】|\[{label}\])"
@@ -297,6 +316,37 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         warn("RATE_CONFLICT", "存在多个收益率，请核对口径", "yield_percent")
 
     amount_tokens = []
+    expression_patterns = [rf"(?:金额|面额|数量)\s*[:=]?\s*({ADDITIVE_AMOUNT})(?![A-Za-z0-9\u4e00-\u9fff./+\-])",
+                           rf"(?<![A-Za-z0-9\u4e00-\u9fff./+\-])({ADDITIVE_AMOUNT})(?![A-Za-z0-9\u4e00-\u9fff./+\-])"]
+    for pattern in expression_patterns:
+        for match in list(re.finditer(pattern, work)):
+            expression = match.group(1)
+            parts = [re.fullmatch(rf"({UNSIGNED_NUMBER})\s*({AMOUNT_UNIT})?", part.strip()) for part in expression.split("+")]
+            explicit = {amount_unit(part.group(2)) for part in parts if part.group(2)}
+            inherited = next(iter(explicit)) if len(explicit) == 1 else settings["default_amount_unit"]
+            components = []
+            for part in parts:
+                value = dec(part.group(1))
+                unit = amount_unit(part.group(2)) or (inherited if len(explicit) < 2 else None)
+                factor = amount_factor(unit, settings)
+                yuan = Decimal(value) * factor if factor is not None else None
+                components.append({"amount_raw": value, "amount_unit": unit,
+                                   "amount_wan": format(yuan / 10000, "f") if yuan is not None else None,
+                                   "source": part.group()})
+            row["amount_components"].extend(components)
+            row["amount_expression"] = "；".join(filter(None, (row["amount_expression"], expression)))
+            if all(part["amount_wan"] is not None for part in components):
+                total = sum((Decimal(part["amount_wan"]) for part in components), Decimal(0))
+                amount_tokens.append((format(total, "f"), "万元", expression))
+                row["notes"].append(f"拆分面额: {expression}（合计 {format(total, 'f')} 万元；未拆为逐笔成交）")
+            else:
+                units = {part["amount_unit"] for part in components}
+                unit = next(iter(units)) if len(units) == 1 else "未确认"
+                total = sum((Decimal(part["amount_raw"]) for part in components), Decimal(0))
+                amount_tokens.append((format(total, "f"), unit, expression))
+                row["notes"].append("拆分面额原文: " + expression)
+                warn("SPLIT_AMOUNT_UNIT", "拆分面额单位未能统一确认，未生成万元合计", "amount_wan")
+            remove(match)
     patterns = [rf"(?:金额|面额|数量)\s*[:=]?\s*({NUMBER})\s*({AMOUNT_UNIT})?",
                 rf"(?<![A-Za-z0-9.])({NUMBER})\s*({AMOUNT_UNIT})(?![A-Za-z0-9])"]
     for pattern in patterns:
@@ -330,13 +380,11 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     if len(amount_tokens) == 1:
         value, unit, snippet = amount_tokens[0]
         unit = unit or settings["default_amount_unit"]
-        unit = {"w": "万元", "W": "万元", "万": "万元", "万元面额": "万元", "万面额": "万元", "亿": "亿元", "亿元面额": "亿元", "亿面额": "亿元", "k": "K"}.get(unit, unit)
+        unit = amount_unit(unit)
         row.update(amount_raw=dec(value), amount_unit=unit)
-        factor = {"元": Decimal(1), "万元": Decimal(10000), "亿元": Decimal(100000000)}.get(unit)
+        factor = amount_factor(unit, settings)
         if unit == "K":
-            if settings["k_multiplier_wan"]:
-                factor = Decimal(settings["k_multiplier_wan"]) * 10000
-            else:
+            if factor is None:
                 warn("K_UNIT", "K 的金额换算尚未确认，请设置或手工填写万元面额", "amount_wan")
         if factor is not None:
             yuan = Decimal(row["amount_raw"]) * factor
@@ -382,6 +430,30 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         tokens = text.split()
         if not tokens:
             return None
+        token = tokens[0]
+        known = {settings["self_company"], *settings["self_aliases"],
+                 *settings["institution_aliases"].keys(), *settings["institution_aliases"].values()} - {""}
+        boundary = None
+        if token not in known:
+            for prefix in sorted(known, key=len, reverse=True):
+                tail = token[len(prefix):] if token.startswith(prefix) else ""
+                if re.fullmatch(r"[\u4e00-\u9fff]{2,4}", tail):
+                    boundary = (prefix, tail)
+                    break
+            if boundary is None:
+                found = re.fullmatch(r"(.+?(?:证券|银行|资管|信托|基金|期货|保险|理财))([\u4e00-\u9fff]{2,4})", token)
+                if found:
+                    boundary = found.groups()
+            if boundary and re.search(r"有限|公司|集团|资产|管理|证券|银行|信托|基金|保险|理财|投资|产品|计划|专户|组合|资管|期货", boundary[1]):
+                boundary = None
+        if boundary:
+            org = institution(boundary[0], settings)
+            row["party_name_candidates"].append({"source": token, "institution": org, "name": boundary[1]})
+            row["contacts"].append({"name": boundary[1], "contact_id": None, "institution": org,
+                                    "source": token, "name_is_candidate": True})
+            row["notes"].append(f"机构姓名暂拆: {token} → {org} / {boundary[1]}")
+            warn("PARTY_NAME_BOUNDARY", "机构与姓名粘连，已暂拆为候选，请核对机构/产品全称和联系人", "counterparty")
+            tokens[0] = boundary[0]
         org = institution(tokens[0], settings)
         for token in tokens[1:]:
             if re.fullmatch(r"Z\d{5,}", token, re.I):
@@ -430,9 +502,11 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         if timestamp:
             row["message_time"] = timestamp.group()
             line = line[:timestamp.start()] + line[timestamp.end():]
-        agreement = re.search(r"约定(?:号|编号)\s*:?\s*([A-Za-z0-9]+)", line)
-        if agreement:
-            row["agreement_no"] = agreement.group(1)
+        for agreement in list(AGREEMENT.finditer(line)):
+            capture_agreement(agreement)
+            line = line[:agreement.start()] + " " * (agreement.end() - agreement.start()) + line[agreement.end():]
+        line = line.strip()
+        if not line:
             continue
         if re.search(r"交易商代码|交易主体代码|交易员代码", line):
             row["trading_codes"].append({"institution": metadata_org, "raw_line": line})
@@ -468,6 +542,8 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
             row["notes"].append(raw_line)
             warn("NOTE_REVIEW", "存在补充文字，请查看原文")
 
+    if len(row["agreement_nos"]) > 1:
+        warn("MULTIPLE_AGREEMENTS", "多个约定号已完整保留；与拆分面额的逐笔对应关系未自动绑定", "agreement_no")
     owner = institution(context["section_owner"] or settings["self_company"], settings)
     if route and context["section_action"] and owner:
         routed_action = "买入" if row["buyer"] == owner else "卖出" if row["seller"] == owner else None
@@ -492,6 +568,8 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
 
 
 def review_record(row: dict) -> dict:
+    if "agreement_no" in row.get("manual_fields", []) or "agreement_nos" not in row:
+        row["agreement_nos"] = [part for part in re.split(r"[,，、/;；\s]+", row.get("agreement_no") or "") if part]
     if not row.get("business_type"):
         row["business_type"] = "回推要素" if "回推" in (row.get("workflow_kind") or "") else "普通报价"
     issues = [item.copy() for item in row.get("parser_issues", []) if item["field"] not in row.get("manual_fields", [])]
