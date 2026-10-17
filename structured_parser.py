@@ -28,6 +28,9 @@ UNSIGNED_NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 AMOUNT_PART = rf"{UNSIGNED_NUMBER}(?:\s*(?:{AMOUNT_UNIT}))?"
 ADDITIVE_AMOUNT = rf"{AMOUNT_PART}(?:\s*\+\s*{AMOUNT_PART})+"
 AGREEMENT = re.compile(r"约定(?:号|编号)\s*:?\s*([A-Za-z0-9]+(?:\s*[,、/]\s*[A-Za-z0-9]+)*)")
+BOND_NAME_TOKEN = r"\d{2}[\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff-]*(?:\([^()\s,;]*\))*"
+CREDIT_LABEL = re.compile(r"(?:中债隐含|发行人)\s*:")
+CREDIT_RATING = r"(?:AAA|AA|A|BBB|BB|B|CCC|CC|C|D)[+-]?"
 # User-supplied working ranges, used as hints rather than validity or market rules.
 COMMON_PRICE_MIN, COMMON_PRICE_MAX = Decimal(80), Decimal(120)
 SMALL_FACE_AMOUNT_WAN = Decimal(200)
@@ -54,6 +57,37 @@ def dec(value: str) -> str:
 
 def clean(value: str) -> str:
     return value.strip(" \t\n,:;，；：")
+
+
+def credit_metadata(value: str) -> dict:
+    """Read explicit credit labels without feeding their digits into quote fields."""
+    result = {"raw_text": value}
+    implied = re.search(r"中债隐含\s*:\s*([^\s,;()]+)", value)
+    issuer = re.search(r"发行人\s*:\s*(.+)$", value)
+    if implied:
+        result["china_bond_implied"] = implied.group(1)  # '0' is a literal label value, not a price or yield.
+    if issuer:
+        body = issuer.group(1).strip()
+        suffix = re.search(r"\(([^()]*)\)\s*$", body)
+        if suffix and (re.search(r"白名单", suffix.group(1)) or re.fullmatch(CREDIT_RATING, suffix.group(1).split(',')[0].strip())):
+            result["issuer"] = body[:suffix.start()].strip()
+            rating = suffix.group(1).split(',')[0].strip()
+            if re.fullmatch(CREDIT_RATING, rating):
+                result["issuer_rating"] = rating
+        else:
+            result["issuer"] = body
+    guarantee_text = value[implied.end() if implied else 0:issuer.start() if issuer else len(value)]
+    guarantor = re.search(r"([^\s,;:()]+?)担保(?=\s*\(|\s|$)", guarantee_text)
+    if guarantor:
+        result["guarantor"] = guarantor.group(1)
+    internal = re.search(rf"内评\s*[:=]?\s*({CREDIT_RATING})(?![A-Za-z+-])", value)
+    if internal:
+        result["internal_rating"] = internal.group(1)
+    if "不在白名单" in value:
+        result["whitelist_status"] = "不在白名单"
+    elif "在白名单" in value:
+        result["whitelist_status"] = "在白名单"
+    return result
 
 
 def settings_from(value: dict | None = None) -> dict:
@@ -149,6 +183,14 @@ def split_records(raw: str) -> tuple[list[dict], list[dict]]:
             current = {"lines": [*pending, (line_number, line)], "quote_line_index": len(pending), "context": context.copy()}
             pending.clear()
         elif ROUTE.search(text) or re.fullmatch(rf"{DATE_TOKEN}(?:\s*\+\s*[0-2])?\s*[,;]?", text):
+            # A bare institution route immediately below a quote belongs to that
+            # quote when it has no route yet. Dated routes still start the next header.
+            dated_header = re.match(rf"{DATE_TOKEN}(?:\s*\+\s*[0-2])?(?=\s|[,;])", text)
+            if (current and ROUTE.search(text) and not dated_header
+                    and not any(ROUTE.search(normalized(value)) for _, value in current["lines"])):
+                current.setdefault("trailing_route_indexes", []).append(len(current["lines"]))
+                current["lines"].append((line_number, line))
+                continue
             if current:
                 records.append(current)
                 current = None
@@ -182,6 +224,7 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
                section_owner=context["section_owner"], workflow_kind=context["section_label"],
                business_type=context.get("business_type", "普通报价"), section_id=context.get("section_id"),
                amount_expression=None, amount_components=[], agreement_nos=[], party_name_candidates=[],
+               credit_metadata={},
                workflow_status="待核对", contacts=[], trading_codes=[], notes=[], requirements=[],
                parser_issues=[], issues=[], evidence={}, manual_fields=[], audit=[], raw_text=raw,
                source_line_start=lines[0][0], source_line_end=lines[-1][0],
@@ -201,7 +244,23 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         evidence("agreement_no", row["agreement_no"], "完整保留同一标签下及后续行的多个约定号，不自动绑定拆分面额")
 
     quote_line_index = segment.get("quote_line_index", 0)
-    work = normalized(" ".join(line for _, line in lines[:quote_line_index + 1]))
+    trailing_routes = set(segment.get("trailing_route_indexes", []))
+    main_lines = []
+    for n, (_, line) in enumerate(lines):
+        if n > quote_line_index and n not in trailing_routes:
+            continue
+        text = normalized(line)
+        marker = CREDIT_LABEL.search(text)
+        if marker:
+            # Credit inventory descriptions run to the end of their OWN line;
+            # never swallow a separately attached institution route below them.
+            tail = text[marker.start():]
+            row["credit_metadata"].update(credit_metadata(tail))
+            row["notes"].append(tail)
+            evidence("notes_text", tail, "显式信用元数据标签；独立保存，不参与面额、报价或收益率分配")
+            text = text[:marker.start()] + " " * len(tail)
+        main_lines.append(text)
+    work = " ".join(main_lines)
     if context.get("section_title"):
         evidence("business_type", context["section_title"], "来自本笔所属分组标题；业务类型独立于买卖动作")
 
@@ -245,11 +304,25 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     code = CODE.search(work)
     if code:
         row["bond_code"] = code.group().upper()
-        after = re.match(r"\s*([^\s,，]+)", work[code.end():])
-        if after:
-            row["bond_name"] = after.group(1)
-            start, end = code.end() + after.start(), code.end() + after.end()
+        opening = re.search(r"([\[(【])\s*$", work[:code.start()])
+        closing = re.match(r"\s*([\])】])", work[code.end():])
+        if opening and closing and {'(': ')', '[': ']', '【': '】'}[opening.group(1)] == closing.group(1):
+            # Code wrappers are separators, including when glued to the name.
+            # Mask only this matched pair; keep annotations that belong to a bond name.
+            start, end = code.end() + closing.start(), code.end() + closing.end()
             work = work[:start] + " " * (end - start) + work[end:]
+            remove(opening)
+        before = re.search(rf"(?<!\S)({BOND_NAME_TOKEN})\s*$", work[:code.start()])
+        after = re.match(rf"\s*({BOND_NAME_TOKEN})(?=\s|$)", work[code.end():])
+        if before and after:
+            warn("NAME_CONFLICT", "代码前后均有债券简称候选，未按位置强行选择，请核对", "bond_name")
+        elif before or after:
+            name = before or after
+            row["bond_name"] = name.group(1)
+            offset = 0 if before else code.end()
+            start, end = offset + name.start(1), offset + name.end(1)
+            work = work[:start] + " " * (end - start) + work[end:]
+            evidence("bond_name", name.group(1), "代码前后识别年份+中文简称；金额、期限和信用标签不能充当券名")
         evidence("bond_code", code.group(), "代码形态识别，未连接证券主数据")
         remove(code)
     else:
@@ -273,7 +346,9 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
             row["date_raw"] = match.group()
             evidence("trade_date", match.group(), "交易日期标签")
             remove(match)
-    leading_date = re.match(rf"\s*({DATE_TOKEN})(?=\s)", work) if code and code.start() > 0 else None
+    # Restrict an unlabeled prefix date to the text physically BEFORE the code.
+    # Earlier removals leave blanks; scanning all of work would jump into the face amount.
+    leading_date = re.match(rf"\s*({DATE_TOKEN})(?=\s)", work[:code.start()]) if code and code.start() > 0 else None
     if leading_date:
         parsed = short_date(leading_date.group(1))
         row["date_raw"] = leading_date.group(1)
@@ -514,7 +589,8 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         row["first_hand_party"] = row["from_party"]
 
     metadata_org = None
-    for raw_line in [*inline_metadata, *(line for _, line in lines[quote_line_index + 1:])]:
+    for raw_line in [*inline_metadata, *(line for n, (_, line) in enumerate(lines)
+                                        if n > quote_line_index and n not in trailing_routes)]:
         line = normalized(raw_line).strip()
         timestamp = re.search(r"(?<!\d)(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)", line)
         if timestamp:

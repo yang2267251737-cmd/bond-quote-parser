@@ -183,6 +183,179 @@ class StructuredParserTests(unittest.TestCase):
         self.assertEqual(row['quote_price'], '104.2671')
         self.assertEqual(row['yield_candidate'], '2.63')
 
+    def test_settlement_only_prefix_does_not_consume_face_amount_as_date(self):
+        for amount in ('2400', '1118'):
+            with self.subTest(amount=amount):
+                text = f'7.14+0\n900020.SH 27演示债子 {amount} 116.483 2.34 示例乙银行 to 示例甲证券'
+                row = parse_quotes(text, self.settings)['records'][0]
+                self.assertEqual(row['amount_wan'], amount)
+                self.assertEqual(row['quote_price'], '116.483')
+                self.assertEqual(row['yield_candidate'], '2.34')
+                self.assertEqual(row['settlement_date'], '07-14')
+                self.assertEqual(row['date_raw'], '7.14+0')
+                self.assertIsNone(row['trade_date'])
+                self.assertNotIn('DATE_INVALID', [issue['code'] for issue in row['issues']])
+
+    def test_route_below_quote_with_optional_date_and_yield(self):
+        for prefix in ('', '7.14+0\n'):
+            for rate in ('', ' 2.34'):
+                with self.subTest(prefix=prefix, rate=rate):
+                    text = f'{prefix}900020.SH 27演示债子 2400 116.483{rate}\n示例乙银行 to 示例甲证券'
+                    result = parse_quotes(text, self.settings)
+                    self.assertEqual(result['record_count'], 1)
+                    self.assertEqual(result['input_warnings'], [])
+                    row = result['records'][0]
+                    self.assertEqual(row['amount_wan'], '2400')
+                    self.assertEqual(row['quote_price'], '116.483')
+                    self.assertEqual(row['yield_candidate'], '2.34' if rate else None)
+                    self.assertEqual(row['action'], '买入')
+                    self.assertEqual(row['seller'], '示例乙银行')
+                    self.assertEqual(row['buyer'], '示例甲证券')
+                    self.assertIsNone(row['trade_date'])
+                    self.assertEqual(row['settlement_date'], '07-14' if prefix else None)
+                    self.assertEqual(row['raw_text'], text)
+                    self.assertEqual(row['source_line_end'], len(text.splitlines()))
+
+    def test_footer_route_keeps_glued_contacts_as_candidates(self):
+        text = '900020.SH 27演示债子 2400 116.483 2.34\n示例乙银行演示丙 to 示例甲证券演示甲'
+        row = parse_quotes(text, self.settings)['records'][0]
+        self.assertEqual(row['action'], '买入')
+        self.assertEqual(row['counterparty'], '示例乙银行')
+        self.assertEqual(row['quote_price'], '116.483')
+        self.assertEqual({contact['name'] for contact in row['contacts']}, {'演示甲', '演示丙'})
+        self.assertTrue(all(contact['name_is_candidate'] for contact in row['contacts']))
+
+    def test_footer_route_and_following_metadata_are_not_double_parsed(self):
+        text = ('900020.SH 27演示债子 2400 116.483\n示例乙银行 to 示例甲证券 约定号0013\n'
+                '联系人：演示丙880000007')
+        row = parse_quotes(text, self.settings)['records'][0]
+        self.assertEqual(row['agreement_nos'], ['0013'])
+        self.assertEqual(row['contacts'][0]['contact_id'], '880000007')
+        self.assertEqual(row['action'], '买入')
+
+    def test_consecutive_quotes_with_footer_routes_do_not_share_parties(self):
+        text = ('900020.SH 27演示债子 2400 116.483\n示例乙银行 to 示例甲证券\n'
+                '900021.SZ 27演示债丑 3600 102.345\n示例甲证券 to 示例丁期货')
+        result = parse_quotes(text, self.settings)
+        a, b = result['records']
+        self.assertEqual([a['action'], b['action']], ['买入', '卖出'])
+        self.assertEqual([a['counterparty'], b['counterparty']], ['示例乙银行', '示例丁期货'])
+        self.assertEqual((a['source_line_end'], b['source_line_start']), (2, 3))
+        self.assertEqual(result['input_warnings'], [])
+
+    def test_dated_header_after_quoteless_direction_is_kept_for_next_bond(self):
+        text = ('900020.SH 27演示债子 2400 116.483\n'
+                '7.15+0，示例甲证券 to 示例乙银行\n900021.SZ 27演示债丑 3600 102.345')
+        a, b = parse_quotes(text, self.settings)['records']
+        self.assertEqual(a['action'], '待确认')
+        self.assertIsNone(a['settlement_date'])
+        self.assertEqual(a['amount_wan'], '2400')
+        self.assertEqual(b['action'], '卖出')
+        self.assertEqual(b['settlement_date'], '07-15')
+
+    def test_route_header_after_complete_quote_is_kept_for_next_bond(self):
+        text = ('900020.SH 27演示债子 2400 116.483 示例乙银行 to 示例甲证券\n'
+                '示例甲证券 to 示例丁期货\n900021.SZ 27演示债丑 3600 102.345')
+        a, b = parse_quotes(text, self.settings)['records']
+        self.assertEqual([a['action'], b['action']], ['买入', '卖出'])
+        self.assertEqual([a['counterparty'], b['counterparty']], ['示例乙银行', '示例丁期货'])
+
+    def test_credit_inventory_uses_name_before_code_and_isolates_metadata(self):
+        text = ('27.3159Y 27演示省债甲 900022.SH 680w 中债隐含：0 发行人：示例甲省人民政府（AAA，不在白名单）\n'
+                '28.2416Y 27演示省债乙 900023.SH 760w 中债隐含：0 发行人：示例乙省人民政府（AAA，不在白名单）\n'
+                '29.5211Y 27演示省债丙 900024.SH 890w 中债隐含：0 发行人：示例丙省人民政府（AAA，不在白名单）\n'
+                '1.7642Y 27演示园区MTN甲 900000018.IB 680w 中债隐含：AA- 示例甲融资担保有限公司担保（内评A-，不在白名单） 发行人：示例园区(集团)有限公司（B，不在白名单）\n'
+                '3.4921Y 27演示企业债甲 900025.SH 680w 中债隐含：AA- 发行人：示例企业集团有限公司（B+，不在白名单）')
+        result = parse_quotes(text, self.settings)
+        rows = result['records']
+        self.assertEqual(len(rows), 5)
+        self.assertEqual([r['bond_name'] for r in rows], ['27演示省债甲', '27演示省债乙', '27演示省债丙', '27演示园区MTN甲', '27演示企业债甲'])
+        self.assertEqual([r['amount_wan'] for r in rows], ['680', '760', '890', '680', '680'])
+        self.assertEqual([r['term'] for r in rows], ['27.3159Y', '28.2416Y', '29.5211Y', '1.7642Y', '3.4921Y'])
+        self.assertEqual([r['credit_metadata']['china_bond_implied'] for r in rows], ['0', '0', '0', 'AA-', 'AA-'])
+        self.assertEqual([r['credit_metadata']['issuer_rating'] for r in rows], ['AAA', 'AAA', 'AAA', 'B', 'B+'])
+        self.assertEqual(rows[3]['credit_metadata']['issuer'], '示例园区(集团)有限公司')
+        self.assertEqual(rows[3]['credit_metadata']['guarantor'], '示例甲融资担保有限公司')
+        self.assertEqual(rows[3]['credit_metadata']['internal_rating'], 'A-')
+        for original, row in zip(text.splitlines(), rows):
+            self.assertEqual(row['raw_text'], original)
+            self.assertEqual(row['action'], '待确认')
+            self.assertIsNone(row['quote_price'])
+            self.assertIsNone(row['yield_percent'])
+            self.assertIsNone(row['yield_candidate'])
+            self.assertIsNone(row['trade_date'])
+            self.assertIsNone(row['settlement_date'])
+            self.assertIn('QUOTE_MISSING', [i['code'] for i in row['issues']])
+            self.assertNotIn('AMOUNT_MISSING', [i['code'] for i in row['issues']])
+            self.assertIn('中债隐含:', row['notes_text'])
+            self.assertEqual(row['credit_metadata']['whitelist_status'], '不在白名单')
+        self.assertEqual(result['original_input'], text)
+
+    def test_credit_zero_cannot_supply_missing_amount_or_quote(self):
+        row = parse_quotes('27演示省债甲 900022.SH 中债隐含：0 发行人：示例甲省（AAA）', self.settings)['records'][0]
+        self.assertEqual(row['bond_name'], '27演示省债甲')
+        self.assertIsNone(row['amount_wan'])
+        self.assertIsNone(row['quote_price'])
+        self.assertIsNone(row['yield_candidate'])
+        self.assertEqual(row['credit_metadata']['china_bond_implied'], '0')
+
+    def test_explicit_quote_before_credit_metadata_is_preserved(self):
+        row = parse_quotes('27演示省债甲 900022.SH 680w 净价103.246 收益率2.73 中债隐含：0 发行人：示例甲省（AAA）', self.settings)['records'][0]
+        self.assertEqual(row['amount_wan'], '680')
+        self.assertEqual(row['quote_price'], '103.246')
+        self.assertEqual(row['yield_percent'], '2.73')
+        self.assertEqual(row['credit_metadata']['issuer'], '示例甲省')
+
+    def test_credit_metadata_does_not_swallow_route_on_following_line(self):
+        text = ('7.14+0\n27演示省债甲 900022.SH 680w 净价103.246 中债隐含：0 发行人：示例甲省（AAA）\n'
+                '示例乙银行 to 示例甲证券')
+        result = parse_quotes(text, self.settings)
+        row = result['records'][0]
+        self.assertEqual(result['record_count'], 1)
+        self.assertEqual(result['input_warnings'], [])
+        self.assertEqual(row['action'], '买入')
+        self.assertEqual(row['quote_price'], '103.246')
+        self.assertEqual(row['settlement_date'], '07-14')
+        self.assertIsNone(row['trade_date'])
+
+    def test_amount_after_code_cannot_be_a_bond_name(self):
+        row = parse_quotes('900022.SH 680w 净价103.246 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertIsNone(row['bond_name'])
+        self.assertEqual(row['amount_wan'], '680')
+        self.assertEqual(row['quote_price'], '103.246')
+        self.assertIn('NAME_MISSING', [i['code'] for i in row['issues']])
+
+    def test_two_adjacent_name_candidates_are_reviewed_instead_of_chosen(self):
+        row = parse_quotes('27演示省债甲 900022.SH 27演示省债乙 680w 净价103.246', self.settings)['records'][0]
+        self.assertIsNone(row['bond_name'])
+        self.assertEqual(row['amount_wan'], '680')
+        self.assertIn('NAME_CONFLICT', [i['code'] for i in row['issues']])
+
+    def test_issuer_parenthetical_company_name_is_preserved(self):
+        row = parse_quotes('27演示省债甲 900022.SH 680w 发行人：示例企业(集团)有限公司', self.settings)['records'][0]
+        self.assertEqual(row['credit_metadata']['issuer'], '示例企业(集团)有限公司')
+        self.assertNotIn('issuer_rating', row['credit_metadata'])
+
+    def test_parenthesized_code_is_not_part_of_name_or_amount(self):
+        for title in ('27演示省债甲(900022.SH)', '27演示省债甲 (900022.SH)',
+                      '27演示省债甲（900022.SH）', '27演示省债甲[900022.SH]',
+                      '27演示省债甲【900022.SH】', '(900022.SH) 27演示省债甲'):
+            with self.subTest(title=title):
+                row = parse_quotes(f'27.3159Y {title} 680w', self.settings)['records'][0]
+                self.assertEqual(row['bond_code'], '900022.SH')
+                self.assertEqual(row['bond_name'], '27演示省债甲')
+                self.assertEqual(row['amount_wan'], '680')
+                self.assertEqual(row['term'], '27.3159Y')
+                self.assertIsNone(row['quote_price'])
+                self.assertIsNone(row['yield_candidate'])
+                self.assertIsNone(row['trade_date'])
+
+    def test_bond_name_annotation_survives_adjacent_code_wrapper(self):
+        row = parse_quotes('27演示MTN甲(示例)(900000018.IB) 680w 净价103.246', self.settings)['records'][0]
+        self.assertEqual(row['bond_name'], '27演示MTN甲(示例)')
+        self.assertEqual(row['amount_wan'], '680')
+        self.assertEqual(row['quote_price'], '103.246')
+
     def test_bridge_section_keeps_both_legs_and_separate_headers(self):
         text = ('10、组合\n'
                 '7.14+0，示例丁期货 to 示例甲证券，请求示例甲证券\n'

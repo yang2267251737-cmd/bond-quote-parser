@@ -110,6 +110,19 @@ class LocalAppTests(unittest.TestCase):
         self.assertEqual(loaded['agreement_nos'], ['0029', '0040'])
         self.assertEqual(loaded['amount_wan'], '360')
 
+    def test_credit_inventory_metadata_and_missing_quote_survive_save(self):
+        sample = '27.3159Y 27演示省债甲 900022.SH 680w 中债隐含：0 发行人：示例甲省（AAA，不在白名单）'
+        batch = self.request('/api/parse', {'text': sample, 'settings': self.settings})
+        saved = self.request('/api/save', batch)
+        loaded = self.request('/api/batches/' + saved['batch_id'])['records'][0]
+        self.assertEqual(loaded['bond_name'], '27演示省债甲')
+        self.assertEqual(loaded['amount_wan'], '680')
+        self.assertIsNone(loaded['quote_price'])
+        self.assertIsNone(loaded['yield_candidate'])
+        self.assertEqual(loaded['credit_metadata']['china_bond_implied'], '0')
+        self.assertEqual(loaded['credit_metadata']['issuer'], '示例甲省')
+        self.assertEqual(loaded['raw_text'], sample)
+
     def test_no_internet_assets_in_app_bootstrap(self):
         data = self.request('/api/bootstrap')
         self.assertEqual(data['settings']['self_company'], '')
