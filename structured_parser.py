@@ -21,13 +21,16 @@ ROUTE = re.compile(r"(?<![A-Za-z])to(?![A-Za-z])|->|=>|→|(?<=\s)出(?=\s)", re
 CONTACT = re.compile(r"([\u4e00-\u9fff]{2,4})\s*(\d{6,12})(?!\d)")
 DATE_TOKEN = r"(?<!\d)(?:\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[./-]\d{1,2}|\d{4})(?!\d)"
 AMOUNT_UNIT = r"万元面额|亿元面额|万元|亿元|万面额|亿面额|万|亿|元|张|手|[wWkK]"
-BARE = re.compile(rf"(?<![A-Za-z0-9\u4e00-\u9fff.])({NUMBER})(%?)(?![A-Za-z0-9\u4e00-\u9fff.])")
+BARE = re.compile(rf"(?<![A-Za-z0-9\u4e00-\u9fff.])({NUMBER})(?:\s*(%))?(?![A-Za-z0-9\u4e00-\u9fff.])")
 WORKFLOW_STATES = ("待核对", "已保存未提交", "已提交")
 BUSINESS_TYPES = ("普通报价", "回推要素", "组合/架桥")
 UNSIGNED_NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 AMOUNT_PART = rf"{UNSIGNED_NUMBER}(?:\s*(?:{AMOUNT_UNIT}))?"
 ADDITIVE_AMOUNT = rf"{AMOUNT_PART}(?:\s*\+\s*{AMOUNT_PART})+"
 AGREEMENT = re.compile(r"约定(?:号|编号)\s*:?\s*([A-Za-z0-9]+(?:\s*[,、/]\s*[A-Za-z0-9]+)*)")
+# User-supplied working ranges, used as hints rather than validity or market rules.
+COMMON_PRICE_MIN, COMMON_PRICE_MAX = Decimal(80), Decimal(120)
+SMALL_FACE_AMOUNT_WAN = Decimal(200)
 
 
 def amount_unit(value):
@@ -353,7 +356,7 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
         for match in list(re.finditer(pattern, work)):
             amount_tokens.append((match.group(1), match.group(2), match.group()))
             remove(match)
-    bare = [(dec(m.group(1)), m.group(2), m.group()) for m in BARE.finditer(work)]
+    bare = [(dec(m.group(1)), m.group(2) or "", m.group().strip()) for m in BARE.finditer(work)]
     for match in list(BARE.finditer(work)):
         remove(match)
     percent = [item for item in bare if item[1] == "%"]
@@ -367,15 +370,24 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     def looks_like_rate(value):
         return abs(Decimal(value)) < 20
 
-    def looks_like_price(value):
-        return Decimal(20) <= Decimal(value) <= Decimal(200)
+    def looks_like_price(value, common=False):
+        low, high = (COMMON_PRICE_MIN, COMMON_PRICE_MAX) if common else (Decimal(20), Decimal(200))
+        return low <= Decimal(value) <= high
 
     # These ranges only disambiguate unlabeled templates. Explicit labels have no range restriction.
-    rate_amount_template = bool(context["section_action"] or re.search(r"\s出\s", work)) and not prices and not rates
-    if rate_amount_template and len(bare) == 2 and not looks_like_rate(bare[0][0]):
-        rate_amount_template = False
+    rate_amount_template = (bool(context["section_action"] or re.search(r"\s出\s", work))
+                            and not prices and not rates and len(bare) == 2 and looks_like_rate(bare[0][0]))
     if not amount_tokens and bare:
-        amount = bare.pop() if rate_amount_template and len(bare) == 2 else bare.pop(0)
+        amount_index = len(bare) - 1 if rate_amount_template and len(bare) == 2 else 0
+        # A unique large face amount can appear before or after the quote. Never use
+        # this shortcut for other default units, or as a ban on smaller quotations.
+        if settings["default_amount_unit"] == "万元" and len(bare) in (2, 3):
+            candidates = [n for n, item in enumerate(bare) if Decimal(item[0]) >= SMALL_FACE_AMOUNT_WAN
+                          and all(looks_like_price(other[0]) or looks_like_rate(other[0])
+                                  for k, other in enumerate(bare) if k != n)]
+            if len(candidates) == 1:
+                amount_index = candidates[0]
+        amount = bare.pop(amount_index)
         amount_tokens.append((amount[0], None, amount[2]))
     if len(amount_tokens) == 1:
         value, unit, snippet = amount_tokens[0]
@@ -398,10 +410,16 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
     if not prices and not rate_amount_template and bare:
         price = None
         if len(bare) == 1:
-            price = bare.pop()
+            # A lone rate-sized number may be a yield-only quote; do not invent a price.
+            if rates or not looks_like_rate(bare[0][0]):
+                price = bare.pop()
         elif len(bare) == 2 and not rates:
-            possibilities = [(p, y) for p in range(2) for y in range(2)
-                             if p != y and looks_like_price(bare[p][0]) and looks_like_rate(bare[y][0])]
+            possibilities = []
+            for common in (True, False):
+                possibilities = [(p, y) for p in range(2) for y in range(2)
+                                 if p != y and looks_like_price(bare[p][0], common) and looks_like_rate(bare[y][0])]
+                if possibilities:
+                    break
             if len(possibilities) == 1:
                 p, y = possibilities[0]
                 price, candidate = bare[p], bare[y]
@@ -411,13 +429,13 @@ def parse_one(segment: dict, index: int, settings: dict) -> dict:
                 warn("PRICE_RATE_AMBIGUOUS", "两个无标签数字无法可靠区分价格与收益率，已保留原值待核对", "quote_price")
         if price:
             row["quote_price"] = price[0]
-            evidence("quote_price", price[2], "面额之后的唯一价格，或通过价格/利率常见区间消歧；不依赖两者先后顺序")
+            evidence("quote_price", price[2], "优先按80–120常见价格区间、再按宽区间消歧；仅单个价格时保留原值；不依赖价格和利率先后顺序")
     if bare and len(bare) == 1 and not rates and not unresolved_pair:
         candidate = bare.pop()
         target = "yield_percent" if settings["unlabeled_rate_is_yield"] else "yield_candidate"
         row[target] = candidate[0]
         row["yield_type"] = "未注明"
-        evidence(target, candidate[2], "分组收益率+金额模板" if rate_amount_template else "面额及价格之外的利率候选；价格与利率允许换序")
+        evidence(target, candidate[2], "分组收益率+金额模板" if rate_amount_template else "面额之外的利率候选；可省略价格或百分号，价格与利率允许换序")
         if target == "yield_candidate":
             warn("UNLABELED_RATE", "无标签利率仅作为候选，可修改配置或手工确认", "yield_candidate")
     if bare:
@@ -593,6 +611,18 @@ def review_record(row: dict) -> dict:
                     raise InvalidOperation
             except (InvalidOperation, ValueError):
                 add("INVALID_" + key, "数值无效: " + key, key)
+    # Recompute hints from current values, including when opening saved batches or editing.
+    for key, code, message in (
+        ("quote_price", "PRICE_UNUSUAL", "价格超出本机业务常见区间80–120元，已保留原值，请核对"),
+        ("amount_wan", "SMALL_FACE_AMOUNT", "面额低于200万元，少于常见业务规模，已保留原值；面额不等于实际成交金额"),
+    ):
+        try:
+            value = Decimal(str(row.get(key)))
+            unusual = (value < COMMON_PRICE_MIN or value > COMMON_PRICE_MAX) if key == "quote_price" else 0 < value < SMALL_FACE_AMOUNT_WAN
+            if value.is_finite() and unusual:
+                add(code, message, key)
+        except (InvalidOperation, ValueError):
+            pass
     if not row.get("amount_wan"):
         add("AMOUNT_MISSING", "缺少可确认的万元面额", "amount_wan")
     # Current normalized amount must follow manual edits; source amount stays intact.

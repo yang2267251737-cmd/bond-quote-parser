@@ -256,6 +256,77 @@ class StructuredParserTests(unittest.TestCase):
         self.assertEqual(row['quote_price'], '15')
         self.assertEqual(row['yield_percent'], '55')
 
+    def test_common_price_amount_and_optional_percent_allow_reordered_numbers(self):
+        for numbers in ('680 103.246 3.12', '680 3.12 103.246', '3.12 103.246 680',
+                        '103.246 680 3.12', '680 103.246 3.12%', '680 103.246 3.12 %',
+                        '680 103.246 3.12 ％'):
+            with self.subTest(numbers=numbers):
+                row = parse_quotes(f'900010.SH 27演示债丁 {numbers} 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+                self.assertEqual(row['amount_wan'], '680')
+                self.assertEqual(row['quote_price'], '103.246')
+                self.assertEqual(row['yield_candidate'], '3.12')
+                self.assertIsNone(row['yield_percent'])
+
+    def test_yield_only_quote_does_not_invent_price(self):
+        for numbers in ('680 3.12', '3.12 680', '680 3.12%', '680 3.12 %'):
+            with self.subTest(numbers=numbers):
+                row = parse_quotes(f'900010.SH 27演示债丁 {numbers} 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+                self.assertEqual(row['amount_wan'], '680')
+                self.assertIsNone(row['quote_price'])
+                self.assertEqual(row['yield_candidate'], '3.12')
+
+    def test_buy_heading_does_not_override_full_price_yield_quote(self):
+        for numbers in ('680 103.246 3.12', '3.12 103.246 680', '103.246 面额680', '680 103.246'):
+            with self.subTest(numbers=numbers):
+                row = parse_quotes(f'买入\n900010.SH 27演示债丁 {numbers} 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+                self.assertEqual(row['amount_wan'], '680')
+                self.assertEqual(row['quote_price'], '103.246')
+                self.assertEqual(row['yield_candidate'], '3.12' if '3.12' in numbers else None)
+
+    def test_price_outside_common_range_is_retained_and_reviewed(self):
+        for price in ('79.5', '120.5', '15', '250'):
+            with self.subTest(price=price):
+                row = parse_quotes(f'900010.SH 27演示债丁 680 净价{price} 收益率7.2 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+                self.assertEqual(row['quote_price'], price)
+                self.assertEqual(row['yield_percent'], '7.2')
+                self.assertIn('PRICE_UNUSUAL', [item['code'] for item in row['issues']])
+
+    def test_unlabeled_price_outside_common_range_can_use_broad_fallback(self):
+        row = parse_quotes('900010.SH 27演示债丁 680 72.5 7.2 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['quote_price'], '72.5')
+        self.assertEqual(row['yield_candidate'], '7.2')
+        self.assertIn('PRICE_UNUSUAL', [item['code'] for item in row['issues']])
+
+    def test_small_face_amount_is_hint_not_rejection_or_cash_calculation(self):
+        row = parse_quotes('900010.SH 27演示债丁 150 净价103.246 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['amount_wan'], '150')
+        self.assertEqual(row['amount_yuan'], '1500000')
+        self.assertIn('SMALL_FACE_AMOUNT', [item['code'] for item in row['issues']])
+
+    def test_common_range_boundaries_and_usual_size_do_not_warn(self):
+        for amount, price in (('200', '80'), ('500', '120'), ('680', '103.246')):
+            with self.subTest(amount=amount, price=price):
+                row = parse_quotes(f'900010.SH 27演示债丁 {amount} 净价{price} 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+                codes = [item['code'] for item in row['issues']]
+                self.assertNotIn('SMALL_FACE_AMOUNT', codes)
+                self.assertNotIn('PRICE_UNUSUAL', codes)
+
+    def test_range_hints_follow_manual_changes_and_keep_original(self):
+        row = parse_quotes('900010.SH 27演示债丁 150 净价79.5 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        original = row['raw_text']
+        row.update(amount_wan='680', quote_price='103.246', manual_fields=['amount_wan', 'quote_price'])
+        review_record(row)
+        self.assertNotIn('SMALL_FACE_AMOUNT', [item['code'] for item in row['issues']])
+        self.assertNotIn('PRICE_UNUSUAL', [item['code'] for item in row['issues']])
+        self.assertEqual(row['raw_text'], original)
+
+    def test_large_amount_shortcut_does_not_apply_to_other_default_units(self):
+        row = parse_quotes('900010.SH 27演示债丁 0.08 103.246 3.12 示例乙银行 to 示例甲证券',
+                           {**self.settings, 'default_amount_unit': '亿元'})['records'][0]
+        self.assertEqual(row['amount_wan'], '800.00')
+        self.assertEqual(row['quote_price'], '103.246')
+        self.assertEqual(row['yield_candidate'], '3.12')
+
     def test_negative_yield_can_follow_unlabeled_price(self):
         row = parse_quotes('900010.SH 27演示债丁 760 103.456 -0.38 示例乙银行 to 示例甲证券', self.settings)['records'][0]
         self.assertEqual(row['quote_price'], '103.456')

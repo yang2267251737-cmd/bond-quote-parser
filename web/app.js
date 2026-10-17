@@ -8,13 +8,13 @@ const columns = [
   ['bond_code', '债券代码'], ['bond_name', '债券简称'],
   ['business_type', '业务类型', ['普通报价', '回推要素', '组合/架桥']], ['amount_wan', '面额（万元）'],
   ['quote_price', '报价价格'], ['price_type', '价格类型', ['', '净价', '全价']],
-  ['rate', '收益率（%）'], ['counterparty', '对手方'], ['requirements_text', '内评／授信'],
+  ['rate', '收益率（%）'], ['agreement_no', '约定号'], ['counterparty', '对手方'], ['requirements_text', '内评／授信'],
   ['workflow_status', '工作状态', ['待核对', '已保存未提交', '已提交']], ['notes_text', '备注'],
   ['seller', '卖方', null, true], ['buyer', '买方', null, true],
   ['trade_date', '交易日期', null, true], ['settlement_date', '结算日期', null, true],
   ['settlement_speed', '结算速度', null, true], ['term', '剩余期限', null, true],
   ['yield_type', '收益率类型', ['', '行权', '到期'], true], ['request_to', '请求发送至', null, true],
-  ['contacts_text', '联系人', null, true], ['agreement_no', '约定号', null, true],
+  ['contacts_text', '联系人', null, true],
   ['theoretical_price', '理论价格', null, true], ['adjustment_amount', '附注金额（元）', null, true]
 ];
 const labels = Object.fromEntries(columns.map(c => [c[0], c[1]]));

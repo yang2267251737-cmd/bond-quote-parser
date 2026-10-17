@@ -98,6 +98,18 @@ class LocalAppTests(unittest.TestCase):
         self.assertEqual(loaded['records'][0]['business_type'], '普通报价')
         self.assertEqual(loaded['original_records'][0]['business_type'], '组合/架桥')
 
+    def test_agreement_identifiers_survive_edit_save_and_reload(self):
+        parsed = self.request('/api/parse', {'text': self.sample + ' 约定号0007，0018', 'settings': self.settings})
+        record = parsed['records'][0]
+        self.assertEqual(record['agreement_nos'], ['0007', '0018'])
+        record.update(agreement_no='0029、0040', manual_fields=['agreement_no'])
+        parsed['records'][0] = self.request('/api/review', {'record': record})['record']
+        saved = self.request('/api/save', parsed)
+        loaded = self.request('/api/batches/' + saved['batch_id'])['records'][0]
+        self.assertEqual(loaded['agreement_no'], '0029、0040')
+        self.assertEqual(loaded['agreement_nos'], ['0029', '0040'])
+        self.assertEqual(loaded['amount_wan'], '360')
+
     def test_no_internet_assets_in_app_bootstrap(self):
         data = self.request('/api/bootstrap')
         self.assertEqual(data['settings']['self_company'], '')
