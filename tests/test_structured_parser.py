@@ -1,5 +1,6 @@
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,6 +9,157 @@ from structured_parser import parse_quotes, settings_from, short_date, review_re
 
 
 class StructuredParserTests(unittest.TestCase):
+    def test_batch_header_is_shared_until_contact_or_layout_boundary(self):
+        text = ('示例乙银行Z90009 to 示例甲证券Z90008\n'
+                '900030.SH 27演示债寅 680 103.456\n900031.SH 27演示债卯 760 104.567\n'
+                '演示丙 880000009\n27.31Y 27演示债寅(900030.SH) 680w')
+        rows = parse_quotes(text, self.settings)['records']
+        self.assertEqual([r['action'] for r in rows], ['买入', '买入', '待确认'])
+        self.assertEqual(rows[1]['counterparty'], '示例乙银行')
+        self.assertEqual(rows[1]['source_context'][0]['line'], 1)
+        self.assertIn('第1行', rows[1]['evidence']['seller']['method'])
+        self.assertNotIn('示例乙银行', rows[1]['raw_text'])
+        self.assertIsNone(rows[2]['quote_price'])
+        self.assertEqual(rows[2]['source_context'], [])
+
+    def test_batch_footer_and_date_are_shared_without_copying_original_rows(self):
+        text = ('2027/7/14 +0\n900030.SH 27演示债寅 680 103.456 约701\n'
+                '900031.SH 27演示债卯 760 104.567 约702\n示例乙银行 演示丙 TO 示例甲证券演示甲')
+        result = parse_quotes(text, self.settings)
+        a, b = result['records']
+        self.assertEqual([a['action'], b['action']], ['买入', '买入'])
+        self.assertEqual([a['counterparty'], b['counterparty']], ['示例乙银行', '示例乙银行'])
+        self.assertEqual([a['settlement_date'], b['settlement_date']], ['2027-07-14'] * 2)
+        self.assertEqual([a['agreement_no'], b['agreement_no']], ['701', '702'])
+        self.assertEqual(a['batch_context_id'], b['batch_context_id'])
+        self.assertEqual(a['source_line_end'], 2)
+        self.assertEqual(b['source_line_start'], 3)
+        self.assertIn('SHARED_ACTION', [issue['code'] for issue in a['issues']])
+        self.assertEqual(result['original_input'], text)
+
+    def test_batch_context_does_not_cross_blank_section_or_new_header(self):
+        for boundary in ('\n', '演示丙 880000009\n', '2、普通报价\n'):
+            with self.subTest(boundary=boundary):
+                text = ('示例乙银行 to 示例甲证券\n900030.SH 27演示债寅 680 103.456\n'
+                        + boundary + '900031.SH 27演示债卯 760 104.567')
+                a, b = parse_quotes(text, self.settings)['records']
+                self.assertEqual(a['action'], '买入')
+                self.assertEqual(b['action'], '待确认')
+
+    def test_numbered_sell_does_not_take_the_next_batch_header(self):
+        text = ('2) 卖出 3.75Y+NY 900000030.IB 27演示MTN寅 2.31行权 680 7.14+0 '
+                '示例甲证券 出给 示例乙银行，发 示例丁期货 演示丁\n'
+                '示例乙银行 to 示例甲证券\n900030.SH 27演示债寅 760 104.567\n'
+                '900031.SH 27演示债卯 890 105.678')
+        a, b, c = parse_quotes(text, self.settings)['records']
+        self.assertEqual([r['action'] for r in (a, b, c)], ['卖出', '买入', '买入'])
+        self.assertIsNone(a['quote_price'])
+        self.assertEqual(a['amount_wan'], '680')
+        self.assertEqual(a['request_to'], '示例丁期货')
+        self.assertEqual(a['counterparty'], '示例乙银行')
+        self.assertEqual(a['term'], '3.75Y+NY')
+        self.assertEqual(a['source_line_end'], 1)
+        self.assertEqual(a['contacts'][0]['name'], '演示丁')
+
+    def test_numbered_yield_only_rows_never_generate_prices(self):
+        for ordinal, term in (('1)', '3.75Y+2Y'), ('28、', '5.25Y + NY')):
+            with self.subTest(ordinal=ordinal):
+                row = parse_quotes(f'{ordinal} 卖出 {term} 900000030.IB 27演示MTN寅 2.31行权 680 '
+                                   '7.14+0 示例甲证券 出给 示例乙银行', self.settings)['records'][0]
+                self.assertEqual(row['amount_wan'], '680')
+                self.assertEqual(row['yield_percent'], '2.31')
+                self.assertIsNone(row['quote_price'])
+                self.assertEqual(row['term'], term)
+
+    def test_chinese_sell_buy_roles_and_large_amount_units(self):
+        for amount in ('1千万', '1千万元', '0.1亿', '10百万'):
+            with self.subTest(amount=amount):
+                row = parse_quotes(f'7月14日 演示YK甲 900030.SH {amount} 净价103.456 '
+                                   '示例乙银行Z90009卖出 示例甲证券演示甲 Z90008 买入', self.settings)['records'][0]
+                self.assertEqual(row['bond_name'], '演示YK甲')
+                self.assertEqual(Decimal(row['amount_wan']), Decimal(1000))
+                self.assertEqual(row['quote_price'], '103.456')
+                self.assertEqual(row['action'], '买入')
+                self.assertEqual(row['counterparty'], '示例乙银行')
+                self.assertEqual(row['trade_date'], '07-14')
+                self.assertIsNone(row['yield_candidate'])
+
+    def test_role_tags_work_in_reverse_order(self):
+        row = parse_quotes('7月14日 演示YK甲 900030.SH 1千万 净价103.456 '
+                           '示例乙银行Z90009买入 示例甲证券演示甲 Z90008 卖出', self.settings)['records'][0]
+        self.assertEqual(row['action'], '卖出')
+        self.assertEqual(row['counterparty'], '示例乙银行')
+
+    def test_report_has_action_and_downstream_without_fabricating_trade_fields(self):
+        row = parse_quotes('27演示MTN寅，今日卖出，下家为示例乙银行，特此报备', self.settings)['records'][0]
+        self.assertEqual(row['action'], '卖出')
+        self.assertEqual(row['counterparty'], '示例乙银行')
+        for key in ('bond_code', 'amount_wan', 'quote_price', 'yield_percent', 'trade_date', 'settlement_date'):
+            self.assertIsNone(row[key])
+        self.assertIn('REPORT_OWNER', [issue['code'] for issue in row['issues']])
+
+    def test_qt_glued_contact_and_optional_inquiry_colon(self):
+        text = ('900030.SH 27演示债寅 680 净价103.456 示例乙银行 to 示例甲证券\n'
+                '询价 示例乙银行 演示丙QT880000009\n联系人 演示丁 示例丁期货')
+        row = parse_quotes(text, self.settings)['records'][0]
+        self.assertEqual(row['contacts'][0]['name'], '演示丙')
+        self.assertEqual(row['contacts'][0]['contact_id'], '880000009')
+        self.assertEqual(row['contacts'][0]['institution'], '示例乙银行')
+        self.assertEqual(row['contacts'][1]['institution'], '示例丁期货')
+
+    def test_inquiry_prefix_and_corresponding_yield_do_not_pollute_parties(self):
+        text = ('演示丙询价2027-7-14 +0 900030.SH 27演示债寅 680 净价103.456 '
+                '对应收益率2.31 示例甲证券 出给 示例乙银行')
+        row = parse_quotes(text, self.settings)['records'][0]
+        self.assertEqual(row['action'], '卖出')
+        self.assertEqual(row['counterparty'], '示例乙银行')
+        self.assertEqual(row['yield_percent'], '2.31')
+        self.assertEqual(row['settlement_date'], '2027-07-14')
+
+    def test_short_agreement_does_not_capture_approximate_amount_or_decimal(self):
+        for suffix in ('约100.5', '约500万元'):
+            with self.subTest(suffix=suffix):
+                row = parse_quotes(f'900030.SH 27演示债寅 680 净价103.456 {suffix}', self.settings)['records'][0]
+                self.assertIsNone(row['agreement_no'])
+
+    def test_shared_context_changes_duplicate_identity(self):
+        text = ('示例乙银行 to 示例甲证券\n900030.SH 27演示债寅 680 103.456\n'
+                '900031.SH 27演示债卯 760 104.567\n\n示例甲证券 to 示例丁期货\n'
+                '900030.SH 27演示债寅 680 103.456\n900031.SH 27演示债卯 760 104.567')
+        rows = parse_quotes(text, self.settings)['records']
+        self.assertEqual([row['action'] for row in rows], ['买入', '买入', '卖出', '卖出'])
+        self.assertTrue(all(row['duplicate_of'] is None for row in rows))
+
+    def test_date_shaped_additive_amount_is_not_a_partial_settlement_date(self):
+        row = parse_quotes('900030.SH 27演示债寅 1118+1000 净价103.456 示例乙银行 to 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['amount_wan'], '2118')
+        self.assertEqual(row['amount_expression'], '1118+1000')
+        self.assertIsNone(row['settlement_date'])
+
+    def test_numbered_explicit_route_remains_relative_to_configured_company(self):
+        row = parse_quotes('1) 卖出 900030.SH 27演示债寅 680 净价103.456 示例乙银行 出给 示例甲证券', self.settings)['records'][0]
+        self.assertEqual(row['action'], '买入')
+        self.assertEqual(row['seller'], '示例乙银行')
+        self.assertEqual(row['buyer'], '示例甲证券')
+
+    def test_code_first_inventory_does_not_inherit_previous_quoted_batch(self):
+        text = ('示例乙银行 to 示例甲证券\n900030.SH 27演示债寅 680 103.456\n'
+                '900031.SH 27演示债卯 760w\n900032.SZ 27演示债辰 890w')
+        a, b, c = parse_quotes(text, self.settings)['records']
+        self.assertEqual(a['action'], '买入')
+        self.assertEqual([b['action'], c['action']], ['待确认', '待确认'])
+        self.assertTrue(all(r['source_context'] == [] for r in (b, c)))
+
+    def test_local_dated_quote_ends_inherited_batch_scope(self):
+        text = ('7.14+0\n示例乙银行 to 示例甲证券\n900030.SH 27演示债寅 680 103.456\n'
+                '900031.SH 27演示债卯 760 104.567 7.15+0\n900032.SZ 27演示债辰 890 105.678')
+        a, b, c = parse_quotes(text, self.settings)['records']
+        self.assertEqual(a['action'], '买入')
+        self.assertEqual(b['settlement_date'], '07-15')
+        self.assertEqual(b['source_context'], [])
+        self.assertIsNone(c['settlement_date'])
+        self.assertEqual(c['action'], '待确认')
+
     def setUp(self):
         self.text = (ROOT / 'examples/software_demo.txt').read_text(encoding='utf-8')
         self.settings = {

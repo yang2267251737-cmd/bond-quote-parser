@@ -15,6 +15,19 @@ from structured_parser import parse_quotes
 
 
 class LocalAppTests(unittest.TestCase):
+    def test_batch_source_context_survives_save_without_changing_raw_quote(self):
+        source = ('示例乙银行 to 示例甲证券\n900030.SH 27演示债寅 680 103.456\n'
+                  '900031.SH 27演示债卯 760 104.567')
+        batch = self.request('/api/parse', {'text': source, 'settings': self.settings})
+        second = batch['records'][1]
+        self.assertEqual(second['action'], '买入')
+        self.assertNotIn('示例乙银行', second['raw_text'])
+        saved = self.request('/api/save', batch)
+        loaded = self.request('/api/batches/' + saved['batch_id'])['records'][1]
+        self.assertEqual(loaded['source_context'], second['source_context'])
+        self.assertEqual(loaded['batch_context_id'], second['batch_context_id'])
+        self.assertEqual(loaded['raw_text'], second['raw_text'])
+
     def setUp(self):
         self.temp_parent = ROOT / '.local-private' / 'test-temp'
         self.temp_parent.mkdir(parents=True, exist_ok=True)
